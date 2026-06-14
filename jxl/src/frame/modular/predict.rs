@@ -497,31 +497,30 @@ impl WeightedPredictorState {
         debug_assert!(cur_row + pos.0 < self.error.len());
         // SAFETY: cur_row <= xsize + 1, so the index is < 2*xsize + 1, which is in-bounds due to
         // the safety invariant (`self.error.len() == 2*(xsize+1)`).
-        let te_w = unsafe { *self.error.get_unchecked(cur_row + pos.0) } as i64;
+        let te_w32 = unsafe { *self.error.get_unchecked(cur_row + pos.0) };
         debug_assert!(prev_row + 1 + pos.0 < self.error.len());
-        // SAFETY: prev_row <= xsize + 1, so the index is <= 2*xsize + 1, which is in-bounds due to
-        // the safety invariant (`self.error.len() == 2*(xsize+1)`).
-        let te_n = unsafe { *self.error.get_unchecked(prev_row + 1 + pos.0) } as i64;
+        let te_n32 = unsafe { *self.error.get_unchecked(prev_row + 1 + pos.0) };
         debug_assert!(prev_row + 1 + pos_nw < self.error.len());
-        // SAFETY: prev_row <= xsize + 1, so the index is <= 2*xsize + 1, which is in-bounds due to
-        // the safety invariant (`self.error.len() == 2*(xsize+1)`).
-        let te_nw = unsafe { *self.error.get_unchecked(prev_row + 1 + pos_nw) } as i64;
-        let sum_wn = te_n + te_w;
+        let te_nw32 = unsafe { *self.error.get_unchecked(prev_row + 1 + pos_nw) };
         debug_assert!(prev_row + 1 + pos_ne < self.error.len());
-        // SAFETY: prev_row <= xsize + 1, so the index is <= 2*xsize + 1, which is in-bounds due to
-        // the safety invariant (`self.error.len() == 2*(xsize+1)`).
-        let te_ne = unsafe { *self.error.get_unchecked(prev_row + 1 + pos_ne) } as i64;
+        let te_ne32 = unsafe { *self.error.get_unchecked(prev_row + 1 + pos_ne) };
 
-        let mut p = te_w;
-        if te_n.abs() > p.abs() {
-            p = te_n;
+        let mut p = te_w32;
+        if te_n32.abs() > p.abs() {
+            p = te_n32;
         }
-        if te_nw.abs() > p.abs() {
-            p = te_nw;
+        if te_nw32.abs() > p.abs() {
+            p = te_nw32;
         }
-        if te_ne.abs() > p.abs() {
-            p = te_ne;
+        if te_ne32.abs() > p.abs() {
+            p = te_ne32;
         }
+
+        let te_w = te_w32 as i64;
+        let te_n = te_n32 as i64;
+        let te_nw = te_nw32 as i64;
+        let te_ne = te_ne32 as i64;
+        let sum_wn = te_n + te_w;
 
         let n = add_bits(data.top);
         let w = add_bits(data.left);
@@ -597,13 +596,21 @@ impl WeightedPredictorState {
         // Compute errors for all predictors
         let mut errs = [0u32; 4];
         if self.is_float {
-            for (err, &pred) in errs.iter_mut().zip(self.prediction.iter()) {
-                *err = (((pred - val as i64).abs() + PREDICTION_ROUND) >> PRED_EXTRA_BITS) as u32;
-            }
+            let v = val as i64;
+            errs[0] = (((self.prediction[0] - v).abs() + PREDICTION_ROUND) >> PRED_EXTRA_BITS) as u32;
+            errs[1] = (((self.prediction[1] - v).abs() + PREDICTION_ROUND) >> PRED_EXTRA_BITS) as u32;
+            errs[2] = (((self.prediction[2] - v).abs() + PREDICTION_ROUND) >> PRED_EXTRA_BITS) as u32;
+            errs[3] = (((self.prediction[3] - v).abs() + PREDICTION_ROUND) >> PRED_EXTRA_BITS) as u32;
         } else {
-            for (err, &pred) in errs.iter_mut().zip(self.prediction.iter()) {
-                *err = (((pred as i32 - val as i32).abs() + PREDICTION_ROUND as i32) >> PRED_EXTRA_BITS) as u32;
-            }
+            let v = val as i32;
+            let p0 = self.prediction[0] as i32;
+            let p1 = self.prediction[1] as i32;
+            let p2 = self.prediction[2] as i32;
+            let p3 = self.prediction[3] as i32;
+            errs[0] = (((p0 - v).abs() + PREDICTION_ROUND as i32) >> PRED_EXTRA_BITS) as u32;
+            errs[1] = (((p1 - v).abs() + PREDICTION_ROUND as i32) >> PRED_EXTRA_BITS) as u32;
+            errs[2] = (((p2 - v).abs() + PREDICTION_ROUND as i32) >> PRED_EXTRA_BITS) as u32;
+            errs[3] = (((p3 - v).abs() + PREDICTION_ROUND as i32) >> PRED_EXTRA_BITS) as u32;
         }
 
         debug_assert!(cur_row + pos.0 < self.pred_errors_buffer.len());
