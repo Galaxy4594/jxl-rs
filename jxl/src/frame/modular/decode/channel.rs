@@ -116,6 +116,7 @@ impl<'a> FullTree<'a> {
         channel: usize,
         stream: usize,
         xsize: usize,
+        is_float: bool,
     ) -> Result<Self> {
         let num_ref_props = tree
             .num_properties
@@ -131,7 +132,7 @@ impl<'a> FullTree<'a> {
             tree,
             references,
             property_buffer,
-            wp_state: WeightedPredictorState::new(wp_header, xsize),
+            wp_state: WeightedPredictorState::new(wp_header, xsize, is_float),
         })
     }
 }
@@ -219,11 +220,12 @@ pub(super) fn decode_modular_channel(
 ) -> Result<()> {
     debug!("reading channel");
     let size = buffers[chan].data.size();
+    let is_float = buffers[chan].bit_depth.floating_point_sample();
     if size.0 <= IMAGE_PADDING.0
         || size.1 <= IMAGE_PADDING.1
         || size.0 * size.1 <= SMALL_CHANNEL_THRESHOLD
     {
-        let mut decoder = FullTree::new(tree, &header.wp_header, chan, stream_id, size.0)?;
+        let mut decoder = FullTree::new(tree, &header.wp_header, chan, stream_id, size.0, is_float)?;
         return decode_modular_channel_impl(
             &mut decoder,
             buffers,
@@ -239,7 +241,7 @@ pub(super) fn decode_modular_channel(
     assert_eq!(buffers[chan].data.offset(), IMAGE_OFFSET);
 
     // We now know the channel has size at least IMAGE_PADDING.
-    run_on_specialized_tree(tree, chan, stream_id, size.0, header, {
+    run_on_specialized_tree(tree, chan, stream_id, size.0, header, is_float, {
         |t| decode_modular_channel_impl(t, buffers, chan, &tree.histograms, reader, br)
     })?;
     br.check_for_error()

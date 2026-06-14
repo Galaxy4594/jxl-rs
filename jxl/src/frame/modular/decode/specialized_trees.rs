@@ -258,8 +258,8 @@ struct WpOnly<R> {
 }
 
 impl<R: Reader> WpOnly<R> {
-    fn new(tree: &[TreeNode], header: &GroupHeader, xsize: usize, reader: R) -> Option<Self> {
-        let wp_state = WeightedPredictorState::new(&header.wp_header, xsize);
+    fn new(tree: &[TreeNode], header: &GroupHeader, xsize: usize, reader: R, is_float: bool) -> Option<Self> {
+        let wp_state = WeightedPredictorState::new(&header.wp_header, xsize, is_float);
         let lut = make_lut(tree)?;
         Some(Self {
             lut,
@@ -416,6 +416,7 @@ pub fn run_on_specialized_tree<F: FnOnce(&mut dyn ModularChannelDecoder) -> Resu
     stream: usize,
     xsize: usize,
     header: &GroupHeader,
+    is_float: bool,
     run: F,
 ) -> Result<()> {
     // TODO(veluca): consider skipping the pruning if header.uses_global_tree is true.
@@ -535,7 +536,7 @@ pub fn run_on_specialized_tree<F: FnOnce(&mut dyn ModularChannelDecoder) -> Resu
 
     if !uses_non_wp
         && !uses_non420
-        && let Some(mut wp) = WpOnly::new(&pruned_tree, header, xsize, Reader420NoLz)
+        && let Some(mut wp) = WpOnly::new(&pruned_tree, header, xsize, Reader420NoLz, is_float)
     {
         return run(&mut wp);
     }
@@ -562,7 +563,7 @@ pub fn run_on_specialized_tree<F: FnOnce(&mut dyn ModularChannelDecoder) -> Resu
         return run(&mut FlatTree::new(inner, ReaderGeneric, ()));
     }
 
-    let wp_state = WeightedPredictorState::new(&header.wp_header, xsize);
+    let wp_state = WeightedPredictorState::new(&header.wp_header, xsize, is_float);
 
     if let Some(ss) = single_symbol {
         return run(&mut FlatTree::new(inner, ss, wp_state));

@@ -202,8 +202,9 @@ pub fn do_palette_step_general(
         }
     } else if predictor == Predictor::Weighted {
         let w = buf_in.data.size().0;
+        let is_float = buf_in.bit_depth.floating_point_sample();
         for (chan_index, out) in buf_out.iter_mut().enumerate() {
-            let mut wp_state = WeightedPredictorState::new(wp_header, w);
+            let mut wp_state = WeightedPredictorState::new(wp_header, w, is_float);
             for y in 0..h {
                 let idx = buf_in.data.row(y);
                 for (x, &index) in idx.iter().enumerate() {
@@ -369,10 +370,11 @@ pub fn do_palette_step_group_row(
         .map(|buf| buf.data.size().0)
         .sum();
     let (xsize, ysize) = buf_out[0].data.size();
+    let is_float = buf_in[0].bit_depth.floating_point_sample();
 
     if predictor == Predictor::Weighted {
         for c in 0..num_c {
-            let mut wp_state = WeightedPredictorState::new(wp_header, total_w);
+            let mut wp_state = WeightedPredictorState::new(wp_header, total_w, is_float);
             let out_row_idx = c * grid_ysize * grid_xsize + grid_y * grid_xsize;
             if grid_y > 0 {
                 let prev_row_idx = out_row_idx - grid_y * grid_xsize;
