@@ -314,7 +314,7 @@ impl Predictor {
 
 const NUM_PREDICTORS: usize = 4;
 const PRED_EXTRA_BITS: i64 = 3;
-const PREDICTION_ROUND: i64 = ((1 << PRED_EXTRA_BITS) >> 1) - 1;
+const PREDICTION_ROUND: i32 = ((1 << PRED_EXTRA_BITS) >> 1) - 1;
 // Allows to approximate division by a number from 1 to 64.
 //  for (int i = 0; i < 64; i++) divlookup[i] = (1 << 24) / (i + 1);
 const DIVLOOKUP: [u32; 64] = [
@@ -327,13 +327,13 @@ const DIVLOOKUP: [u32; 64] = [
 ];
 
 #[inline(always)]
-fn add_bits(x: i32) -> i64 {
-    (x as i64) << PRED_EXTRA_BITS
+fn add_bits(x: i32) -> i32 {
+    x << PRED_EXTRA_BITS
 }
 
 #[derive(Debug)]
 pub struct WeightedPredictorState {
-    prediction: [i64; NUM_PREDICTORS],
+    prediction: [i32; NUM_PREDICTORS],
     pred: i64,
     // Safety invariant:
     // - computing `(xsize + 1) * 2` does not overflow
@@ -466,30 +466,23 @@ impl WeightedPredictorState {
         let err2 = err_n[2].wrapping_add(err_ne[2]).wrapping_add(err_nw[2]);
         let err3 = err_n[3].wrapping_add(err_ne[3]).wrapping_add(err_nw[3]);
 
-        let shift0 = (err0 as u64 + 1).ilog2().saturating_sub(5);
-        let shift1 = (err1 as u64 + 1).ilog2().saturating_sub(5);
-        let shift2 = (err2 as u64 + 1).ilog2().saturating_sub(5);
-        let shift3 = (err3 as u64 + 1).ilog2().saturating_sub(5);
+        #[inline(always)]
+        fn error_weight(err: u32, w: u32) -> u32 {
+            let log = (err as u64 + 1).ilog2();
+            if log < 5 {
+                4u32 + w * unsafe { *DIVLOOKUP.get_unchecked(err as usize) }
+            } else {
+                let shift = log - 5;
+                4u32 + ((w * unsafe { *DIVLOOKUP.get_unchecked(err as usize >> shift) }) >> shift)
+            }
+        }
 
-        debug_assert!(err0 >> shift0 < 64);
-        // SAFETY: x >> ((x+1).ilog2().saturating_sub(5)) < 64 for any x (see `error_weight_bounds`).
-        // (Note: the compiler doesn't seem to realize this)
-        let div0 = unsafe { *DIVLOOKUP.get_unchecked(err0 as usize >> shift0) };
-        debug_assert!(err1 >> shift1 < 64);
-        // SAFETY: same as div0
-        let div1 = unsafe { *DIVLOOKUP.get_unchecked(err1 as usize >> shift1) };
-        debug_assert!(err2 >> shift2 < 64);
-        // SAFETY: same as div0
-        let div2 = unsafe { *DIVLOOKUP.get_unchecked(err2 as usize >> shift2) };
-        debug_assert!(err3 >> shift3 < 64);
-        // SAFETY: same as div0
-        let div3 = unsafe { *DIVLOOKUP.get_unchecked(err3 as usize >> shift3) };
+        let w0 = error_weight(err0, self.w[0] as u32);
+        let w1 = error_weight(err1, self.w[1] as u32);
+        let w2 = error_weight(err2, self.w[2] as u32);
+        let w3 = error_weight(err3, self.w[3] as u32);
 
-        let w0 = 4u32 + ((self.w[0] as u32 * div0) >> shift0);
-        let w1 = 4u32 + ((self.w[1] as u32 * div1) >> shift1);
-        let w2 = 4u32 + ((self.w[2] as u32 * div2) >> shift2);
-        let w3 = 4u32 + ((self.w[3] as u32 * div3) >> shift3);
-        // Safety note: we know that w0, w1, w2, w3 >= 4 because u8 * DIVLOOKUP[i] + 4 never
+        // Safety note: we know that w0, w1, w2, w3 >= 4 because w * DIVLOOKUP[i] + 4 never
         // overflows.
         debug_assert!(w0 >= 4);
         debug_assert!(w1 >= 4);
@@ -502,20 +495,20 @@ impl WeightedPredictorState {
         debug_assert!(cur_row + pos.0 < self.error.len());
         // SAFETY: cur_row <= xsize + 1, so the index is < 2*xsize + 1, which is in-bounds due to
         // the safety invariant (`self.error.len() == 2*(xsize+1)`).
-        let te_w = unsafe { *self.error.get_unchecked(cur_row + pos.0) as i64 };
+        let te_w = unsafe { *self.error.get_unchecked(cur_row + pos.0) };
         debug_assert!(prev_row + 1 + pos.0 < self.error.len());
         // SAFETY: prev_row <= xsize + 1, so the index is <= 2*xsize + 1, which is in-bounds due to
         // the safety invariant (`self.error.len() == 2*(xsize+1)`).
-        let te_n = unsafe { *self.error.get_unchecked(prev_row + 1 + pos.0) as i64 };
+        let te_n = unsafe { *self.error.get_unchecked(prev_row + 1 + pos.0) };
         debug_assert!(prev_row + 1 + pos_nw < self.error.len());
         // SAFETY: prev_row <= xsize + 1, so the index is <= 2*xsize + 1, which is in-bounds due to
         // the safety invariant (`self.error.len() == 2*(xsize+1)`).
-        let te_nw = unsafe { *self.error.get_unchecked(prev_row + 1 + pos_nw) as i64 };
+        let te_nw = unsafe { *self.error.get_unchecked(prev_row + 1 + pos_nw) };
         let sum_wn = te_n + te_w;
         debug_assert!(prev_row + 1 + pos_ne < self.error.len());
         // SAFETY: prev_row <= xsize + 1, so the index is <= 2*xsize + 1, which is in-bounds due to
         // the safety invariant (`self.error.len() == 2*(xsize+1)`).
-        let te_ne = unsafe { *self.error.get_unchecked(prev_row + 1 + pos_ne) as i64 };
+        let te_ne = unsafe { *self.error.get_unchecked(prev_row + 1 + pos_ne) };
 
         let mut p = te_w;
         if te_n.abs() > p.abs() {
@@ -535,14 +528,14 @@ impl WeightedPredictorState {
         let nn = add_bits(data.toptop);
 
         let p0 = w + ne - n;
-        let p1 = n - (((sum_wn + te_ne) * self.p1c as i64) >> 5);
-        let p2 = w - (((sum_wn + te_nw) * self.p2c as i64) >> 5);
+        let p1 = n - (((sum_wn + te_ne) * self.p1c as i32) >> 5);
+        let p2 = w - (((sum_wn + te_nw) * self.p2c as i32) >> 5);
         let p3 = n
-            - ((te_nw * (self.p3c[0] as i64)
-                + (te_n * (self.p3c[1] as i64))
-                + (te_ne * (self.p3c[2] as i64))
-                + ((nn - n) * (self.p3c[3] as i64))
-                + ((nw - w) * (self.p3c[4] as i64)))
+            - ((te_nw * (self.p3c[0] as i32)
+                + (te_n * (self.p3c[1] as i32))
+                + (te_ne * (self.p3c[2] as i32))
+                + ((nn - n) * (self.p3c[3] as i32))
+                + ((nw - w) * (self.p3c[4] as i32)))
                 >> 5);
 
         let log_weight = floor_log2_nonzero(w0 as u64 + w1 as u64 + w2 as u64 + w3 as u64);
@@ -567,7 +560,7 @@ impl WeightedPredictorState {
         // shifting rounds down. This last quantity is at most 64 (in fact, at most 31),
         // as checked in scaled_weight_bounds (note that 16 <= w0 + w1 + w2 + w3 <= 4 * u32::MAX)
 
-        let sum = (weight_sum >> 1) - 1 + w0s * p0 + w1s * p1 + w2s * p2 + w3s * p3;
+        let sum = (weight_sum >> 1) - 1 + w0s * p0 as i64 + w1s * p1 as i64 + w2s * p2 as i64 + w3s * p3 as i64;
 
         // SAFETY: given that weight_sum > 0 and weight_sum <= 64, weight_sum - 1 is
         // in bounds of DIVLOOKUP.
@@ -575,13 +568,13 @@ impl WeightedPredictorState {
             (sum * unsafe { *DIVLOOKUP.get_unchecked((weight_sum - 1) as usize) } as i64) >> 24;
 
         if ((te_n ^ te_w) | (te_n ^ te_nw)) <= 0 {
-            let mx = w.max(ne.max(n));
-            let mn = w.min(ne.min(n));
+            let mx = w.max(ne.max(n)) as i64;
+            let mn = w.min(ne.min(n)) as i64;
             pred = mn.max(mx.min(pred));
         }
         self.prediction = [p0, p1, p2, p3];
         self.pred = pred;
-        ((pred + PREDICTION_ROUND) >> PRED_EXTRA_BITS, p as i32)
+        ((pred + PREDICTION_ROUND as i64) >> PRED_EXTRA_BITS, p)
     }
 
     #[allow(unsafe_code)]
@@ -597,7 +590,7 @@ impl WeightedPredictorState {
         debug_assert!(cur_row + pos.0 + 1 < self.error.len());
         // SAFETY: cur_row <= xsize + 1, so the index is <= 2*xsize + 1, which is in-bounds due to
         // the safety invariant (`self.error.len() == 2*(xsize+1)`).
-        unsafe { *self.error.get_unchecked_mut(cur_row + pos.0 + 1) = (self.pred - val) as i32 };
+        unsafe { *self.error.get_unchecked_mut(cur_row + pos.0 + 1) = (self.pred - val as i64) as i32 };
 
         // Compute errors for all predictors
         let err0 =
