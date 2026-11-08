@@ -85,6 +85,35 @@ impl ImageInfo {
 
         let xsize = file_header.size.xsize() as usize;
         let ysize = file_header.size.ysize() as usize;
+        if level5_limits {
+            let max_dim = 1 << 18;
+            if xsize as u64 > max_dim {
+                return Err(Error::level_limit(
+                    level5_limits,
+                    "width",
+                    xsize as u64,
+                    max_dim,
+                ));
+            }
+            if ysize as u64 > max_dim {
+                return Err(Error::level_limit(
+                    level5_limits,
+                    "height",
+                    ysize as u64,
+                    max_dim,
+                ));
+            }
+            let total_pixels = (xsize as u64) * (ysize as u64);
+            let max_pixels = 1 << 28;
+            if total_pixels > max_pixels {
+                return Err(Error::level_limit(
+                    level5_limits,
+                    "width * height",
+                    total_pixels,
+                    max_pixels,
+                ));
+            }
+        }
         check_size_limit(
             decode_options.sample_limit,
             (xsize, ysize),

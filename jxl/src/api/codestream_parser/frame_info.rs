@@ -180,6 +180,37 @@ impl FrameInfo {
             effective_nonvisible_samples,
         )?;
 
+        if level5_limits {
+            let (fxsize, fysize) = frame_header.size_upsampled();
+            let max_dim = 1 << 18;
+            if fxsize as u64 > max_dim {
+                return Err(Error::level_limit(
+                    level5_limits,
+                    "frame width",
+                    fxsize as u64,
+                    max_dim,
+                ));
+            }
+            if fysize as u64 > max_dim {
+                return Err(Error::level_limit(
+                    level5_limits,
+                    "frame height",
+                    fysize as u64,
+                    max_dim,
+                ));
+            }
+            let frame_pixels = (fxsize as u64) * (fysize as u64);
+            let max_pixels = 1 << 28;
+            if frame_pixels > max_pixels {
+                return Err(Error::level_limit(
+                    level5_limits,
+                    "frame width * height",
+                    frame_pixels,
+                    max_pixels,
+                ));
+            }
+        }
+
         if level5_limits
             && frame_header.duration > 0
             && let Some(anim) = &file_header.image_metadata.animation
