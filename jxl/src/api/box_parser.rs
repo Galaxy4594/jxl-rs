@@ -1017,11 +1017,512 @@ pub fn extract_codestream(mut input_bytes: &[u8]) -> Result<(Vec<u8>, Option<Pro
     Ok((codestream, parser.container_level()))
 }
 
+struct BitWriter {
+    bytes: Vec<u8>,
+    bit_pos: usize,
+}
+
+impl BitWriter {
+    fn with_capacity(cap_bytes: usize) -> Result<Self> {
+        Ok(Self {
+            bytes: Vec::new_with_capacity(cap_bytes)?,
+            bit_pos: 0,
+        })
+    }
+
+    fn write_bits(&mut self, mut n: usize, mut val: u64) {
+        while n > 0 {
+            let byte_idx = self.bit_pos >> 3;
+            let bit_idx = self.bit_pos & 7;
+            if byte_idx >= self.bytes.len() {
+                self.bytes.push(0);
+            }
+            let chunk = n.min(8 - bit_idx);
+            let mask = (1u64 << chunk) - 1;
+            self.bytes[byte_idx] |= ((val & mask) as u8) << bit_idx;
+            val >>= chunk;
+            n -= chunk;
+            self.bit_pos += chunk;
+        }
+    }
+
+    fn write_bool(&mut self, v: bool) {
+        self.write_bits(1, u64::from(v));
+    }
+
+    fn append_bits_range(&mut self, src: &[u8], start_bit: usize, num_bits: usize) {
+        let mut pos = start_bit;
+        let mut rem = num_bits;
+        while rem > 0 {
+            let byte_idx = pos >> 3;
+            let bit_idx = pos & 7;
+            let chunk = rem.min(8 - bit_idx);
+            let val = u64::from(src[byte_idx] >> bit_idx);
+            self.write_bits(chunk, val);
+            pos += chunk;
+            rem -= chunk;
+        }
+    }
+
+    fn zero_pad_to_byte(&mut self) {
+        self.bit_pos = self.bit_pos.div_ceil(8) * 8;
+        let needed_bytes = self.bit_pos >> 3;
+        if self.bytes.len() < needed_bytes {
+            self.bytes.resize(needed_bytes, 0);
+        }
+    }
+}
+
+fn set_codestream_orientation(codestream: &[u8], orientation: u8) -> Result<Vec<u8>> {
+    use crate::bit_reader::BitReader;
+    use crate::headers::JxlHeader;
+    use crate::headers::bit_depth::BitDepth;
+    use crate::headers::color_encoding::ColorEncoding;
+    use crate::headers::encodings::{
+        ConditionalCoder, DefaultedCoder, Empty, Extensions, U32, U32Coder, UnconditionalCoder,
+        VectorCoder,
+    };
+    use crate::headers::extra_channels::ExtraChannelInfo;
+    use crate::headers::image_metadata::{Animation, Orientation, Signature, ToneMapping};
+    use crate::headers::size::{Preview, Size};
+    use crate::headers::transform_data::{CustomTransformData, CustomTransformDataNonserialized};
+    use crate::icc::IncrementalIccReader;
+
+    if !(1..=8).contains(&orientation) {
+        return Err(Error::InvalidEnum(
+            u32::from(orientation),
+            "Orientation".to_string(),
+        ));
+    }
+
+    let mut br = BitReader::new(codestream);
+    let _sig = Signature::read(&mut br)?;
+    let _size = Size::read(&mut br)?;
+
+    let metadata_start_bit = br.total_bits_read();
+    let all_default = bool::read_unconditional(&(), &mut br, &Empty {})?;
+
+    let mut extra_fields = false;
+    let mut cur_orientation = 1u8;
+    let mut have_intrinsic_size = false;
+    let mut have_preview = false;
+    let mut have_animation = false;
+    let mut extra_fields_header_end_bit = 0usize;
+    let mut non_extra_fields_is_default = true;
+    let mut after_color_encoding_bit = 0usize;
+    let mut tone_mapping_all_default = true;
+    let mut after_tone_mapping_bit = 0usize;
+    let mut want_icc = false;
+    let mut xyb_encoded = true;
+
+    if !all_default {
+        extra_fields = bool::read_unconditional(&(), &mut br, &Empty {})?;
+        if extra_fields {
+            let o = Orientation::read_unconditional(
+                &U32Coder::Direct(U32::BitsOffset { n: 3, off: 1 }),
+                &mut br,
+                &Empty {},
+            )?;
+            cur_orientation = o as u8;
+            have_intrinsic_size = bool::read_unconditional(&(), &mut br, &Empty {})?;
+            let _intrinsic_size =
+                Option::<Size>::read_conditional(&(), have_intrinsic_size, &mut br, &Empty {})?;
+            have_preview = bool::read_unconditional(&(), &mut br, &Empty {})?;
+            let _preview =
+                Option::<Preview>::read_conditional(&(), have_preview, &mut br, &Empty {})?;
+            have_animation = bool::read_unconditional(&(), &mut br, &Empty {})?;
+            let _animation =
+                Option::<Animation>::read_conditional(&(), have_animation, &mut br, &Empty {})?;
+            extra_fields_header_end_bit = br.total_bits_read();
+        }
+
+        let bit_depth_start_bit = br.total_bits_read();
+        let bit_depth = BitDepth::read_unconditional(&(), &mut br, &Empty {})?;
+        let bit_depth_is_default = bit_depth == BitDepth::default(&Empty {})
+            && br.total_bits_read() - bit_depth_start_bit == 3;
+
+        let modular_16bit_sufficient = bool::read_unconditional(&(), &mut br, &Empty {})?;
+
+        let ec_start_bit = br.total_bits_read();
+        let extra_channel_info = Vec::<ExtraChannelInfo>::read_unconditional(
+            &VectorCoder {
+                size_coder: U32Coder::Select(
+                    U32::Val(0),
+                    U32::Val(1),
+                    U32::BitsOffset { n: 4, off: 2 },
+                    U32::BitsOffset { n: 12, off: 1 },
+                ),
+                value_coder: (),
+            },
+            &mut br,
+            &Empty {},
+        )?;
+        let ec_is_default =
+            extra_channel_info.is_empty() && br.total_bits_read() - ec_start_bit == 2;
+
+        xyb_encoded = bool::read_unconditional(&(), &mut br, &Empty {})?;
+
+        let ce_start_bit = br.total_bits_read();
+        let ce_all_default = br.peek(1) != 0;
+        let color_encoding = ColorEncoding::read_unconditional(&(), &mut br, &Empty {})?;
+        after_color_encoding_bit = br.total_bits_read();
+        want_icc = color_encoding.want_icc;
+        let ce_is_default = ce_all_default && after_color_encoding_bit - ce_start_bit == 1;
+
+        if extra_fields {
+            tone_mapping_all_default = br.peek(1) != 0;
+        }
+        let _tone_mapping = ToneMapping::read_defaulted(
+            &(),
+            extra_fields,
+            ToneMapping::default(&Empty {}),
+            &mut br,
+            &Empty {},
+        )?;
+        after_tone_mapping_bit = br.total_bits_read();
+
+        let ext_start_bit = br.total_bits_read();
+        let _extensions = Option::<Extensions>::read_conditional(&(), true, &mut br, &Empty {})?;
+        let ext_is_default = br.total_bits_read() - ext_start_bit == 2;
+
+        non_extra_fields_is_default = bit_depth_is_default
+            && modular_16bit_sufficient
+            && ec_is_default
+            && xyb_encoded
+            && ce_is_default
+            && ext_is_default;
+    }
+
+    let metadata_end_bit = br.total_bits_read();
+
+    let _transform_data = CustomTransformData::read_unconditional(
+        &(),
+        &mut br,
+        &CustomTransformDataNonserialized { xyb_encoded },
+    )?;
+
+    if want_icc {
+        let mut icc_reader = IncrementalIccReader::new(&mut br, false)?;
+        for _ in 0..icc_reader.remaining() {
+            icc_reader.read_one(&mut br)?;
+        }
+        icc_reader.finalize(&mut br)?;
+    }
+
+    let header_end_bit = br.total_bits_read();
+    br.jump_to_byte_boundary()?;
+    let frames_start_byte = br.total_bits_read() / 8;
+
+    if cur_orientation == orientation {
+        return Ok(codestream.to_vec());
+    }
+
+    // Fast path: if extra_fields is already true and either the new orientation is non-default
+    // or other extra_fields are still active, overwrite the 3 orientation bits in place.
+    let other_extra_fields_active =
+        have_intrinsic_size || have_preview || have_animation || !tone_mapping_all_default;
+    if !all_default && extra_fields && (orientation != 1 || other_extra_fields_active) {
+        let mut out = codestream.to_vec();
+        let orient_val = orientation - 1;
+        for i in 0..3 {
+            let bit_pos = metadata_start_bit + 2 + i;
+            let byte_idx = bit_pos >> 3;
+            let bit_idx = bit_pos & 7;
+            if ((orient_val >> i) & 1) != 0 {
+                out[byte_idx] |= 1 << bit_idx;
+            } else {
+                out[byte_idx] &= !(1 << bit_idx);
+            }
+        }
+        return Ok(out);
+    }
+
+    let mut bw = BitWriter::with_capacity(frames_start_byte + 8)?;
+    bw.append_bits_range(codestream, 0, metadata_start_bit);
+
+    if all_default {
+        // Expanding all_default = true to set orientation != 1.
+        bw.write_bool(false); // all_default = false
+        bw.write_bool(true); // extra_fields = true
+        bw.write_bits(3, u64::from(orientation - 1));
+        bw.write_bool(false); // have_intrinsic_size = false
+        bw.write_bool(false); // have_preview = false
+        bw.write_bool(false); // have_animation = false
+        bw.write_bool(false); // bit_depth.floating_point_sample = false
+        bw.write_bits(2, 0); // bit_depth.bits_per_sample = 8 (selector 0)
+        bw.write_bool(true); // modular_16bit_sufficient = true
+        bw.write_bits(2, 0); // num_extra = 0 (selector 0)
+        bw.write_bool(true); // xyb_encoded = true
+        bw.write_bool(true); // color_encoding.all_default = true
+        bw.write_bool(true); // tone_mapping.all_default = true
+        bw.write_bits(2, 0); // extensions = 0 (selector 0)
+    } else if !extra_fields {
+        // !all_default && !extra_fields, setting orientation != 1.
+        bw.write_bool(false); // all_default = false
+        bw.write_bool(true); // extra_fields = true
+        bw.write_bits(3, u64::from(orientation - 1));
+        bw.write_bool(false); // have_intrinsic_size = false
+        bw.write_bool(false); // have_preview = false
+        bw.write_bool(false); // have_animation = false
+        // Copy bit_depth .. color_encoding verbatim.
+        bw.append_bits_range(
+            codestream,
+            metadata_start_bit + 2,
+            after_color_encoding_bit - (metadata_start_bit + 2),
+        );
+        bw.write_bool(true); // tone_mapping.all_default = true
+        // Copy extensions verbatim.
+        bw.append_bits_range(
+            codestream,
+            after_color_encoding_bit,
+            metadata_end_bit - after_color_encoding_bit,
+        );
+    } else {
+        // !all_default && extra_fields && orientation == 1 && !other_extra_fields_active.
+        if non_extra_fields_is_default {
+            bw.write_bool(true); // Collapse back to all_default = true!
+        } else {
+            bw.write_bool(false); // all_default = false
+            bw.write_bool(false); // Collapse extra_fields = false!
+            // Copy bit_depth .. color_encoding verbatim.
+            bw.append_bits_range(
+                codestream,
+                extra_fields_header_end_bit,
+                after_color_encoding_bit - extra_fields_header_end_bit,
+            );
+            // Skip tone_mapping, copy extensions verbatim.
+            bw.append_bits_range(
+                codestream,
+                after_tone_mapping_bit,
+                metadata_end_bit - after_tone_mapping_bit,
+            );
+        }
+    }
+
+    // Copy CustomTransformData and optional ICC stream verbatim.
+    bw.append_bits_range(
+        codestream,
+        metadata_end_bit,
+        header_end_bit - metadata_end_bit,
+    );
+    bw.zero_pad_to_byte();
+
+    let mut out = bw.bytes;
+    out.try_reserve(codestream.len() - frames_start_byte)?;
+    out.extend_from_slice(&codestream[frames_start_byte..]);
+    Ok(out)
+}
+
+fn replace_codestream_in_container(container: &[u8], new_codestream: &[u8]) -> Result<Vec<u8>> {
+    if !container.starts_with(&CONTAINER_SIGNATURE) {
+        return Err(Error::InvalidBox);
+    }
+
+    struct RawBox<'a> {
+        ty: [u8; 4],
+        payload: &'a [u8],
+    }
+
+    let mut boxes = Vec::new();
+    let mut first_codestream_idx = None;
+    let mut pos = CONTAINER_SIGNATURE.len();
+    while pos < container.len() {
+        if pos + 8 > container.len() {
+            return Err(Error::InvalidBox);
+        }
+        let size32 = u32::from_be_bytes(container[pos..pos + 4].try_into().unwrap());
+        let ty: [u8; 4] = container[pos + 4..pos + 8].try_into().unwrap();
+        let (header_len, box_len) = match size32 {
+            1 => {
+                if pos + 16 > container.len() {
+                    return Err(Error::InvalidBox);
+                }
+                let size64 = u64::from_be_bytes(container[pos + 8..pos + 16].try_into().unwrap());
+                if size64 < 16 {
+                    return Err(Error::InvalidBox);
+                }
+                let len = usize::try_from(size64).map_err(|_| Error::InvalidBox)?;
+                (16usize, len)
+            }
+            0 => (8usize, container.len() - pos),
+            n => {
+                let len = n as usize;
+                if len < 8 {
+                    return Err(Error::InvalidBox);
+                }
+                (8usize, len)
+            }
+        };
+        if pos
+            .checked_add(box_len)
+            .is_none_or(|end| end > container.len())
+        {
+            return Err(Error::InvalidBox);
+        }
+        if &ty == b"jxlc" || &ty == b"jxlp" {
+            if first_codestream_idx.is_none() {
+                first_codestream_idx = Some(boxes.len());
+            }
+        } else {
+            boxes.push(RawBox {
+                ty,
+                payload: &container[pos + header_len..pos + box_len],
+            });
+        }
+        pos += box_len;
+    }
+
+    let insert_at = first_codestream_idx.unwrap_or_else(|| {
+        let mut idx = 0;
+        for (i, b) in boxes.iter().enumerate() {
+            if &b.ty == b"ftyp" || &b.ty == b"jxll" {
+                idx = i + 1;
+            }
+        }
+        idx
+    });
+
+    let mut out = Vec::new_with_capacity(container.len() + 16)?;
+    out.extend_from_slice(&CONTAINER_SIGNATURE);
+
+    for (i, b) in boxes.iter().enumerate() {
+        if i == insert_at {
+            append_box_header(b"jxlc", new_codestream.len(), &mut out);
+            out.extend_from_slice(new_codestream);
+        }
+        append_box_header(&b.ty, b.payload.len(), &mut out);
+        if &b.ty == b"ftyp" && b.payload.len() >= 8 {
+            out.extend_from_slice(&b.payload[..4]);
+            out.extend_from_slice(&0u32.to_be_bytes());
+            out.extend_from_slice(&b.payload[8..]);
+        } else {
+            out.extend_from_slice(b.payload);
+        }
+    }
+    if insert_at == boxes.len() {
+        append_box_header(b"jxlc", new_codestream.len(), &mut out);
+        out.extend_from_slice(new_codestream);
+    }
+
+    Ok(out)
+}
+
+#[doc(hidden)]
+pub fn set_orientation(input_bytes: &[u8], orientation: u8) -> Result<Vec<u8>> {
+    match check_signature(input_bytes) {
+        JxlSignature::Codestream => set_codestream_orientation(input_bytes, orientation),
+        JxlSignature::Container => {
+            let (codestream, _) = extract_codestream(input_bytes)?;
+            let new_codestream = set_codestream_orientation(&codestream, orientation)?;
+            replace_codestream_in_container(input_bytes, &new_codestream)
+        }
+        _ => Err(Error::InvalidSignature),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::IoSliceMut;
 
-    use super::{BoxParser, CodestreamInput};
+    use super::{
+        BoxParser, CodestreamInput, check_signature, extract_codestream, pack_codestream,
+        set_orientation,
+    };
+    use crate::api::{Event, JxlDecoder, JxlDecoderOptions, JxlSignature, Orientation};
+
+    fn extract_or_self(data: &[u8]) -> Vec<u8> {
+        if check_signature(data) == JxlSignature::Container {
+            extract_codestream(data).unwrap().0
+        } else {
+            data.to_vec()
+        }
+    }
+
+    fn decode_basic_info_orientation(mut data: &[u8]) -> (Orientation, (usize, usize)) {
+        let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
+        loop {
+            match decoder.process(&mut data, None, None).unwrap() {
+                Event::BasicInfo => {
+                    let info = decoder.basic_info().unwrap();
+                    return (info.orientation, info.size);
+                }
+                Event::NeedMoreInput { .. } => panic!("unexpected NeedMoreInput"),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn set_orientation_roundtrip_codestream_and_container() {
+        let test_images: &[(&str, &[u8])] = &[
+            (
+                "bicycles.jxl",
+                include_bytes!("../../resources/test/conformance_test_images/bicycles.jxl"),
+            ),
+            (
+                "bench_oriented_brg.jxl",
+                include_bytes!(
+                    "../../resources/test/conformance_test_images/bench_oriented_brg.jxl"
+                ),
+            ),
+            (
+                "cmyk_layers.jxl",
+                include_bytes!("../../resources/test/conformance_test_images/cmyk_layers.jxl"),
+            ),
+            (
+                "animation_icos4d.jxl",
+                include_bytes!("../../resources/test/conformance_test_images/animation_icos4d.jxl"),
+            ),
+            (
+                "spot.jxl",
+                include_bytes!("../../resources/test/conformance_test_images/spot.jxl"),
+            ),
+            (
+                "opsin_inverse.jxl",
+                include_bytes!("../../resources/test/conformance_test_images/opsin_inverse.jxl"),
+            ),
+        ];
+
+        for &(name, orig) in test_images {
+            let (orig_orient, (orig_w, orig_h)) = decode_basic_info_orientation(orig);
+            let unoriented_size = if orig_orient.is_transposing() {
+                (orig_h, orig_w)
+            } else {
+                (orig_w, orig_h)
+            };
+
+            for orient in 1u8..=8 {
+                let modified = set_orientation(orig, orient).expect(name);
+                let (dec_orient, (w, h)) = decode_basic_info_orientation(&modified);
+                assert_eq!(dec_orient as u8, orient, "{name}");
+                let expected_size = if dec_orient.is_transposing() {
+                    (unoriented_size.1, unoriented_size.0)
+                } else {
+                    unoriented_size
+                };
+                assert_eq!((w, h), expected_size, "{name}");
+
+                // Setting back to orig_orient restores the exact original codestream bytes.
+                let restored = set_orientation(&modified, orig_orient as u8).expect(name);
+                assert_eq!(
+                    extract_or_self(&restored),
+                    extract_or_self(orig),
+                    "{name} after orient {orient}"
+                );
+            }
+        }
+
+        // Also test on a container input.
+        let orig = include_bytes!("../../resources/test/conformance_test_images/bicycles.jxl");
+        let (_, (orig_w, orig_h)) = decode_basic_info_orientation(orig);
+        let packed = pack_codestream(orig, 0).unwrap();
+        let packed_rot = set_orientation(&packed, 6).unwrap();
+        let (dec_orient, (w, h)) = decode_basic_info_orientation(&packed_rot);
+        assert_eq!(dec_orient, Orientation::Rotate90Cw);
+        assert_eq!((w, h), (orig_h, orig_w));
+        let packed_restored = set_orientation(&packed_rot, 1).unwrap();
+        assert_eq!(packed_restored, packed);
+    }
 
     /// Regression: a zero-length skippable box must not leave the parser stuck at
     /// `SkippableBox(0)` when more container input is available.

@@ -8,7 +8,22 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use color_eyre::eyre::{Result, WrapErr, bail, ensure};
-use jxl::api::{JxlSignature, ProfileLevel, check_signature, extract_codestream, pack_codestream};
+use jxl::api::{
+    JxlSignature, ProfileLevel, check_signature, extract_codestream, pack_codestream,
+    set_orientation,
+};
+
+fn parse_orientation(s: &str) -> Result<u8, String> {
+    match s.parse::<u16>() {
+        Ok(v @ 1..=8) => Ok(v as u8),
+        Ok(90) => Ok(6),
+        Ok(180) => Ok(3),
+        Ok(270) => Ok(8),
+        _ => Err(format!(
+            "orientation value: expected [1,8] or 90, 180, or 270 (degrees clockwise), got '{s}'"
+        )),
+    }
+}
 
 #[derive(Parser)]
 #[command(version = jxl_cli::VERSION_STRING)]
@@ -41,6 +56,25 @@ struct Opt {
     /// Extract the JXL codestream from a container file
     #[clap(long, action, conflicts_with_all = ["pack", "level10"])]
     extract: bool,
+
+    /// Set the orientation field in the image header.
+    /// Orientation values (Exif semantics):
+    ///   1 = normal (no transform)
+    ///   2 = flip horizontally
+    ///   3 = rotate 180 (alias: 180)
+    ///   4 = flip vertically
+    ///   5 = transpose (rotate 90 CW + flip H)
+    ///   6 = rotate 90 clockwise (alias: 90)
+    ///   7 = flip H + rotate 90 CW
+    ///   8 = rotate 90 counter-clockwise (alias: 270)
+    /// Aliases 90, 180, 270 are degrees of rotation clockwise.
+    #[clap(
+        long,
+        value_name = "1..8|90|180|270",
+        value_parser = parse_orientation,
+        verbatim_doc_comment
+    )]
+    set_orientation: Option<u8>,
 }
 
 fn apply_file_format_options(
@@ -53,9 +87,12 @@ fn apply_file_format_options(
             signature == JxlSignature::Container,
             "Input file is not a container file."
         );
-        let (codestream, level) = extract_codestream(input_bytes)?;
+        let (mut codestream, level) = extract_codestream(input_bytes)?;
         if level == Some(ProfileLevel::Main10) {
             eprintln!("Warning: extracting raw codestream that is greater than level 5");
+        }
+        if let Some(orientation) = opt.set_orientation {
+            codestream = set_orientation(&codestream, orientation)?;
         }
         Ok(codestream)
     } else if opt.pack || opt.level10.is_some() {
@@ -63,7 +100,13 @@ fn apply_file_format_options(
             signature == JxlSignature::Codestream,
             "Input file is not a codestream file"
         );
-        Ok(pack_codestream(input_bytes, opt.level10.unwrap_or(3))?)
+        let codestream = match opt.set_orientation {
+            Some(orientation) => set_orientation(input_bytes, orientation)?,
+            None => input_bytes.to_vec(),
+        };
+        Ok(pack_codestream(&codestream, opt.level10.unwrap_or(3))?)
+    } else if let Some(orientation) = opt.set_orientation {
+        Ok(set_orientation(input_bytes, orientation)?)
     } else {
         Ok(input_bytes.to_vec())
     }
